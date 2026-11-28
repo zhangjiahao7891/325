@@ -1,19 +1,24 @@
 // ============================================================
 //  穷小子打工记 · 联机服务器（零依赖，纯 Node.js）
 //  启动：node server.js
-//  端口：process.env.PORT 或 3000
+//  端口：process.env.PORT 或 8080
 // ============================================================
 'use strict';
 
 const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
+const pathLib = require('path');
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
-const ADMIN_P1 = process.env.ADMIN_P1 || '6767';
-const ADMIN_P2 = process.env.ADMIN_P2 || '7891';
-const ANN_FILE = './announcement.json';
+const ADMIN_P1 = process.env.ADMIN_P1 || '3256';
+const ADMIN_P2 = process.env.ADMIN_P2 || '1604';
+// 数据目录：默认当前目录；在 Railway 挂载 Volume 后可设 DATA_DIR=/data 永久保存
+const DATA_DIR = process.env.DATA_DIR || '.';
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (e) {}
+const ANN_FILE = DATA_DIR + '/announcement.json';
+const SAVE_FILE = DATA_DIR + '/saves.json';
 
 // ---- 公告（登录页展示，管理员在后台发布）----
 function loadAnnouncement() {
@@ -24,6 +29,30 @@ function saveAnnouncement() {
   try { fs.writeFileSync(ANN_FILE, JSON.stringify(announcement)); } catch (e) {}
 }
 
+// ---- 云端存档：user -> { pass, save, updatedAt } ----
+function loadSaves() {
+  try { return JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8')); } catch (e) { return {}; }
+}
+let saves = loadSaves();
+let saveFlushTimer = null;
+function persistSaves() {
+  if (saveFlushTimer) return;
+  saveFlushTimer = setTimeout(() => {
+    saveFlushTimer = null;
+    try { fs.writeFileSync(SAVE_FILE, JSON.stringify(saves)); } catch (e) {}
+  }, 400);
+}
+
+// ---- 封禁名单 ----
+const BAN_FILE = DATA_DIR + '/bans.json';
+function loadBans() {
+  try { return new Set(JSON.parse(fs.readFileSync(BAN_FILE, 'utf8'))); } catch (e) { return new Set(); }
+}
+let banned = loadBans();
+function saveBans() {
+  try { fs.writeFileSync(BAN_FILE, JSON.stringify([...banned])); } catch (e) {}
+}
+
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
@@ -31,41 +60,212 @@ const CORS = {
   'Access-Control-Max-Age': '86400',
 };
 
-// HTTP：API 路由（公告）+ 状态页
+function jsonRes(res, code, obj) {
+  res.writeHead(code, { ...CORS, 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+function readBody(req, cb) {
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 300000) req.destroy(); });
+  req.on('end', () => { let d = {}; try { d = JSON.parse(body || '{}'); } catch (e) {} cb(d); });
+}
+
+// 托管前端页面：把页面里的默认后端域名替换成当前访问域名
+const FRONTEND_DEFAULT_DOMAIN = '373-production-3d8c4377.up.railway.app';
+function serveFrontend(req, res, file) {
+  let html;
+  try { html = fs.readFileSync(pathLib.join(__dirname, file), 'utf8'); }
+  catch (e) { res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('页面文件不存在：' + file); return; }
+  // 用当前访问地址替换页面里的默认后端地址（自动适配域名/端口/协议）
+  const host = req.headers.host || '';
+  // 本地/内网用 ws://，其余（Railway/公网，已由代理终止 TLS）用 wss://
+  const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?$/i.test(host);
+  if (host) {
+    const origin = (isLocal ? 'ws://' : 'wss://') + host;
+    html = html.split('wss://' + FRONTEND_DEFAULT_DOMAIN).join(origin);
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+  res.end(html);
+}
+
+// HTTP：API 路由（公告 + 云端存档）+ 状态页
 const server = http.createServer((req, res) => {
-  const url = (req.url || '/').split('?')[0];
-
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
+  let urlObj;
+  try { urlObj = new URL(req.url || '/', 'http://localhost'); } catch (e) { urlObj = new URL('http://localhost/'); }
+  const path = urlObj.pathname;
+  const q = urlObj.searchParams;
 
-  if (url === '/api/announcement') {
-    if (req.method === 'GET') {
-      res.writeHead(200, { ...CORS, 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(announcement));
-      return;
-    }
+  // —— 健康检查（用来确认后端是否在线）——
+  if (path === '/api/health') {
+    return jsonRes(res, 200, {
+      ok: true,
+      service: '穷小子打工记 联机服务器',
+      port: PORT,
+      version: '1.2',
+      uptime: Math.floor(process.uptime()),
+      players: [...clients.values()].filter((c) => c.name).length,
+      hasFrontend: { index: fs.existsSync(pathLib.join(__dirname, 'index.html')), admin: fs.existsSync(pathLib.join(__dirname, 'admin.html')) },
+      time: Date.now(),
+    });
+  }
+
+  // —— 公告 ——
+  if (path === '/api/announcement') {
+    if (req.method === 'GET') return jsonRes(res, 200, announcement);
     if (req.method === 'POST') {
-      let body = '';
-      req.on('data', (c) => { body += c; if (body.length > 8192) req.destroy(); });
-      req.on('end', () => {
-        let data = {};
-        try { data = JSON.parse(body || '{}'); } catch (e) {}
-        if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) {
-          res.writeHead(403, { ...CORS, 'Content-Type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: false, error: '管理员密码错误' }));
-          return;
-        }
+      readBody(req, (data) => {
+        if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
         announcement = { text: String(data.text || '').slice(0, 500), updatedAt: Date.now() };
         saveAnnouncement();
         broadcast({ type: 'announcement', text: announcement.text, updatedAt: announcement.updatedAt });
-        res.writeHead(200, { ...CORS, 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
+        jsonRes(res, 200, { ok: true });
       });
       return;
     }
   }
 
-  res.writeHead(200, { ...CORS, 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('穷小子打工记 联机服务器运行中\n\n把游戏页面带上 ?server= 参数指向本服务器即可联机。');
+  // —— 读取云端存档 ——
+  if (path === '/api/save' && req.method === 'GET') {
+    const user = (q.get('user') || '').trim();
+    const pass = q.get('pass') || '';
+    if (!user) return jsonRes(res, 400, { ok: false, error: '缺少用户名' });
+    const rec = saves[user];
+    if (!rec) return jsonRes(res, 200, { ok: true, save: null });
+    if (rec.pass !== pass) return jsonRes(res, 403, { ok: false, error: '存档密码不符' });
+    return jsonRes(res, 200, { ok: true, save: rec.save });
+  }
+
+  // —— 写入云端存档 ——
+  if (path === '/api/save' && req.method === 'POST') {
+    readBody(req, (data) => {
+      const user = String(data.user || '').trim();
+      const pass = String(data.pass || '');
+      if (!user || !pass) return jsonRes(res, 400, { ok: false, error: '参数不完整' });
+      if (saves[user] && saves[user].pass !== pass) return jsonRes(res, 403, { ok: false, error: '密码不符' });
+      saves[user] = { pass, save: data.save, updatedAt: Date.now() };
+      persistSaves();
+      jsonRes(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // —— 管理员：存档列表 ——
+  if (path === '/api/saves' && req.method === 'GET') {
+    if (q.get('p1') !== ADMIN_P1 || q.get('p2') !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+    const list = Object.keys(saves).map((k) => ({
+      user: k,
+      updatedAt: saves[k].updatedAt,
+      gems: (saves[k].save && saves[k].save.gems) || 0,
+      vehicle: (saves[k].save && saves[k].save.vehicle) || null,
+    }));
+    return jsonRes(res, 200, { ok: true, saves: list });
+  }
+
+  // —— 管理员：删除存档 ——
+  if (path === '/api/save/delete' && req.method === 'POST') {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      delete saves[String(data.user || '')];
+      persistSaves();
+      jsonRes(res, 200, { ok: true });
+    });
+    return;
+  }
+
+  // —— 管理员终端指令 ——
+  if (path === '/api/admin/online' && req.method === 'GET') {
+    if (q.get('p1') !== ADMIN_P1 || q.get('p2') !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+    const online = [...clients.values()].filter((c) => c.name).map((c) => c.name);
+    return jsonRes(res, 200, { ok: true, online });
+  }
+  const adminRoute = (name, handler) => path === name && req.method === 'POST';
+  if (adminRoute('/api/admin/kill')) {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      const target = String(data.target || '').trim();
+      let found = 0;
+      for (const c of clients.values()) {
+        if (c.name === target) {
+          found++;
+          try { sendFrame(c.socket, Buffer.from(JSON.stringify({ type: 'adminkill', reason: '被管理员处决' }))); } catch (e) {}
+        }
+      }
+      jsonRes(res, 200, { ok: found > 0, error: found ? '' : '玩家不在线' });
+    });
+    return;
+  }
+  if (adminRoute('/api/admin/ban')) {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      const target = String(data.target || '').trim();
+      if (!target) return jsonRes(res, 400, { ok: false, error: '缺少目标用户名' });
+      banned.add(target); saveBans();
+      for (const c of clients.values()) {
+        if (c.name === target) {
+          try { sendFrame(c.socket, Buffer.from(JSON.stringify({ type: 'banned' }))); } catch (e) {}
+          try { c.socket.destroy(); } catch (e) {}
+        }
+      }
+      jsonRes(res, 200, { ok: true });
+    });
+    return;
+  }
+  if (adminRoute('/api/admin/unban')) {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      const target = String(data.target || '').trim();
+      banned.delete(target); saveBans();
+      jsonRes(res, 200, { ok: true });
+    });
+    return;
+  }
+  if (adminRoute('/api/admin/kick')) {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      const target = String(data.target || '').trim();
+      let found = 0;
+      for (const c of clients.values()) {
+        if (c.name === target) {
+          found++;
+          try { sendFrame(c.socket, Buffer.from(JSON.stringify({ type: 'kicked' }))); } catch (e) {}
+          try { c.socket.destroy(); } catch (e) {}
+        }
+      }
+      jsonRes(res, 200, { ok: found > 0, error: found ? '' : '玩家不在线' });
+    });
+    return;
+  }
+  if (adminRoute('/api/admin/announce')) {
+    readBody(req, (data) => {
+      if (data.p1 !== ADMIN_P1 || data.p2 !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+      announcement = { text: String(data.text || '').slice(0, 500), updatedAt: Date.now() };
+      saveAnnouncement();
+      broadcast({ type: 'announcement', text: announcement.text, updatedAt: announcement.updatedAt });
+      jsonRes(res, 200, { ok: true });
+    });
+    return;
+  }
+  if (path === '/api/admin/bans' && req.method === 'GET') {
+    if (q.get('p1') !== ADMIN_P1 || q.get('p2') !== ADMIN_P2) return jsonRes(res, 403, { ok: false, error: '管理员密码错误' });
+    return jsonRes(res, 200, { ok: true, bans: [...banned] });
+  }
+
+  // —— 托管前端页面：/ 打开游戏，/admin.html 打开后台 ——
+  if (req.method === 'GET' && (path === '/' || path === '/index.html')) {
+    return serveFrontend(req, res, 'index.html');
+  }
+  if (req.method === 'GET' && path === '/admin.html') {
+    return serveFrontend(req, res, 'admin.html');
+  }
+
+  res.writeHead(200, { ...CORS, 'Content-Type': 'text/html; charset=utf-8' });
+  res.end('<!DOCTYPE html><html><head><meta charset="utf-8"><title>穷小子打工记</title></head>' +
+    '<body style="font-family:sans-serif;background:#14141f;color:#eee;padding:40px">' +
+    '<h2>🍉 穷小子打工记 · 联机服务器运行中</h2>' +
+    '<p>游戏页面：<a style="color:#ffb347" href="/">打开游戏</a></p>' +
+    '<p>管理后台：<a style="color:#ffb347" href="/admin.html">打开后台</a></p>' +
+    '</body></html>');
 });
 
 // 在线玩家表：id -> { id, name, x, y, facing, moving }
@@ -200,12 +400,35 @@ setInterval(() => {
   }
 }, 15000);
 
+function sanitizeSkin(skin) {
+  if (!skin || typeof skin !== 'object') return null;
+  if (skin.type === 'preset') {
+    const i = Number(skin.index);
+    if (!Number.isFinite(i) || i < 0 || i > 63) return null;
+    return { type: 'preset', index: Math.floor(i) };
+  }
+  if (skin.type === 'custom' && typeof skin.b64 === 'string' && skin.b64.startsWith('data:image/')) {
+    if (skin.b64.length > 400000) return null;
+    return { type: 'custom', b64: skin.b64 };
+  }
+  return null;
+}
+
 function handleMessage(client, text) {
   let msg;
   try { msg = JSON.parse(text); } catch (e) { return; }
   switch (msg.type) {
     case 'join': {
-      const name = String(msg.name || '玩家').slice(0, 12);
+      let name = String(msg.name || '玩家').slice(0, 12);
+      const accountName = name;   // 账号名（用于封禁 / 识别）
+      // 游客命名：进入游戏后显示名 = guestN（按在线人数递增）
+      if (msg.guest) {
+        const taken = new Set();
+        for (const c of clients.values()) if (c.name) taken.add(c.name);
+        let n = taken.size + 1;
+        while (taken.has('guest' + n)) n++;
+        name = 'guest' + n;
+      }
       // 踢掉同名旧连接（刷新 / 重登 / 关页面没断干净 → 消除分身）
       for (const [oid, oc] of [...clients]) {
         if (oid !== client.id && oc.name === name) {
@@ -219,17 +442,33 @@ function handleMessage(client, text) {
         client.id = msg.id;
         clients.set(client.id, client);
       }
+      // 封禁检查（账号名或显示名）
+      if (banned.has(accountName) || banned.has(name)) {
+        try { sendFrame(client.socket, Buffer.from(JSON.stringify({ type: 'banned' }))); } catch (e) {}
+        clients.delete(client.id);
+        try { client.socket.destroy(); } catch (e) {}
+        return;
+      }
       client.name = name;
+      client.account = accountName;
       client.x = Number(msg.x) || 2000;
       client.y = Number(msg.y) || 900;
       client.facing = msg.facing || 'down';
+      client.vehicle = msg.vehicle || null;
+      client.riding = !!msg.riding;
+      client.hidden = !!msg.hidden;
+      client.skin = sanitizeSkin(msg.skin);
       send(client, {
         type: 'init',
+        name: name,
+        account: accountName,
         players: [...clients.values()].map(p => ({
           id: p.id, name: p.name, x: p.x, y: p.y, facing: p.facing, moving: p.moving,
+          vehicle: p.vehicle || null, riding: !!p.riding, hidden: !!p.hidden,
+          skin: p.skin || null,
         })),
       });
-      broadcast({ type: 'join', id: client.id, name: client.name, x: client.x, y: client.y, facing: client.facing, moving: false }, client.id);
+      broadcast({ type: 'join', id: client.id, name: client.name, x: client.x, y: client.y, facing: client.facing, moving: false, vehicle: client.vehicle, riding: client.riding, hidden: client.hidden, skin: client.skin }, client.id);
       break;
     }
 
@@ -238,12 +477,33 @@ function handleMessage(client, text) {
       client.y = Number(msg.y) || client.y;
       client.facing = msg.facing || client.facing;
       client.moving = !!msg.moving;
-      broadcast({ type: 'move', id: client.id, x: client.x, y: client.y, facing: client.facing, moving: client.moving }, client.id);
+      client.vehicle = msg.vehicle || null;
+      client.riding = !!msg.riding;
+      client.hidden = !!msg.hidden;
+      broadcast({ type: 'move', id: client.id, x: client.x, y: client.y, facing: client.facing, moving: client.moving, vehicle: client.vehicle, riding: client.riding, hidden: client.hidden }, client.id);
+      break;
+
+    case 'skin':
+      if (!client.name) break;
+      client.skin = sanitizeSkin(msg.skin);
+      broadcast({ type: 'skin', id: client.id, skin: client.skin }, client.id);
       break;
 
     case 'chat':
       if (!client.name) break;
       broadcast({ type: 'chat', id: client.id, name: client.name, text: String(msg.text || '').slice(0, 200) }, client.id);
+      break;
+
+    // 镐子攻击其他玩家：转发给目标玩家
+    case 'hit':
+      if (!client.name) break;
+      broadcast({
+        type: 'hit',
+        targetId: String(msg.targetId || ''),
+        dmg: Math.max(1, Math.min(99, Number(msg.dmg) || 1)),
+        from: client.name,
+        fromId: client.id,
+      }, client.id);
       break;
   }
 }
